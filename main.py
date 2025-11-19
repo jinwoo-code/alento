@@ -3,6 +3,7 @@ import shutil
 import uuid
 import json
 import datetime
+import asyncio  # ★ 추가: 비동기 처리를 위해 필요
 from typing import List, Annotated
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException, Depends, status,
@@ -31,8 +32,6 @@ import schemas
 import auth
 from database import SessionLocal, engine, get_db
 
-
-
 # --- 1. 초기 설정: DB 테이블 생성, 환경 변수 및 앱 생성 ---
 models.Base.metadata.create_all(bind=engine)
 load_dotenv()
@@ -55,10 +54,10 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,       # ★ "이 주소들로부터의 요청을 허용한다"
-    allow_credentials=True,      # 쿠키/인증 헤더 허용
-    allow_methods=["*"],         # 모든 HTTP 메소드(GET, POST 등) 허용
-    allow_headers=["*"],         # 모든 HTTP 헤더 허용
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def notify_user(user_id: int, title: str, body: str, db):
@@ -85,7 +84,6 @@ def notify_user(user_id: int, title: str, body: str, db):
 # ★★★ 실시간 영상 WebSocket 연결 관리자 ★★★
 class VideoConnectionManager:
     def __init__(self):
-        # {device_id: [연결된_앱_WebSocket, ...]}
         self.active_connections: dict[int, List[WebSocket]] = {}
 
     async def connect(self, device_id: int, websocket: WebSocket):
@@ -99,27 +97,35 @@ class VideoConnectionManager:
             try:
                 self.active_connections[device_id].remove(websocket)
             except ValueError:
-                print(f"[WARN] 연결 해제 요청... 하지만 {websocket}는 이미 제거된 상태입니다.")
+                pass
 
+    # ★★★ 여기가 핵심 수정 부분입니다 ★★★
     async def broadcast_to_device_viewers(self, device_id: int, data: bytes):
-        """특정 기기를 '시청' 중인 모든 앱에 영상 데이터를 전송합니다."""
-        if device_id in self.active_connections:
-            # 연결이 끊긴 클라이언트를 수집
-            disconnected_clients = []
-            for connection in self.active_connections[device_id]:
-                try:
-                    await connection.send_bytes(data)
-                except Exception:
-                    # 전송 실패 → 연결이 끊긴 상태
-                    disconnected_clients.append(connection)
-            
-            # 끊긴 클라이언트 안전하게 제거
-            for client in disconnected_clients:
-                try:
-                    self.active_connections[device_id].remove(client)
-                except ValueError:
-                    # 이미 제거되었을 수 있음 → 조용히 패스
-                    print(f"[WARN] client {client} already removed from active list!")
+        """
+        순차 전송(for loop) 대신 병렬 전송(asyncio.gather)을 사용하여
+        한 클라이언트의 지연이 다른 클라이언트에게 영향을 주지 않도록 합니다.
+        """
+        if device_id not in self.active_connections:
+            return
+
+        connections = self.active_connections[device_id]
+        if not connections:
+            return
+
+        # 모든 연결에 대해 전송 작업을 동시에 생성
+        tasks = [connection.send_bytes(data) for connection in connections]
+        
+        # 동시에 실행하고 결과 대기 (return_exceptions=True로 에러가 나도 멈추지 않게 함)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 전송 실패한 연결(연결 끊김 등) 정리
+        dead_connections = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                dead_connections.append(connections[i])
+        
+        for dead in dead_connections:
+            self.disconnect(device_id, dead)
 
 video_manager = VideoConnectionManager()
 
@@ -130,6 +136,7 @@ def startup_event():
     """서버가 시작될 때 무거운 모델들을 로드합니다."""
     global storage_client, bucket, stt_pipe, llm_model, system_instruction
 
+    # 주의: 실제 배포 시에는 json 파일을 코드에 포함하지 말고 환경변수나 보안 저장소를 사용하세요.
     cred = credentials.Certificate(os.getenv("FIREBASE_ADMIN_KEY", "firebase_admin_key.json"))
     firebase_admin.initialize_app(cred)
     print("Firebase Admin SDK 초기화 완료")
@@ -140,9 +147,11 @@ def startup_event():
         storage_client = storage.Client()
         GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
         if not GCS_BUCKET_NAME:
-            raise ValueError("GCS_BUCKET_NAME이 .env 파일에 설정되지 않았습니다.")
-        bucket = storage_client.bucket(GCS_BUCKET_NAME)
-        print("GCS 클라이언트 초기화 완료.")
+            # 로컬 테스트 등을 위해 예외를 띄우지 않고 경고만 출력할 수도 있음
+            print("주의: GCS_BUCKET_NAME이 설정되지 않았습니다.")
+        else:
+            bucket = storage_client.bucket(GCS_BUCKET_NAME)
+            print("GCS 클라이언트 초기화 완료.")
     except Exception as e:
         print(f"GCS 클라이언트 초기화 실패: {e}")
 
@@ -183,7 +192,8 @@ def text_to_speech(text: str, filename: str) -> str:
     tts.save(filename)
     return filename
 
-def get_llm_response(current_user: models.User, full_transcript: str, device: models.Device = None) -> str:
+# ★ 수정: db 세션을 인자로 받도록 변경 (불필요한 세션 생성 방지)
+def get_llm_response(current_user: models.User, full_transcript: str, db: Session, device: models.Device = None) -> str:
     global llm_model, system_instruction
 
     # 1) 유저 상태
@@ -202,8 +212,7 @@ def get_llm_response(current_user: models.User, full_transcript: str, device: mo
             "device_memo": device.memo
         }
 
-    # 3) 🔥 사용자 일정 불러오기
-    db = SessionLocal()
+    # 3) 🔥 사용자 일정 불러오기 (전달받은 db 세션 사용)
     appointments = db.query(models.Appointment).filter(
         models.Appointment.user_id == current_user.id
     ).order_by(models.Appointment.start_time.asc()).all()
@@ -216,8 +225,7 @@ def get_llm_response(current_user: models.User, full_transcript: str, device: mo
         }
         for a in appointments
     ]
-    db.close()
-
+    
     # 4) 🔥 일정 정보 포함한 전체 프롬프트 구성
     full_prompt = f"""
     {system_instruction}
@@ -239,7 +247,6 @@ def get_llm_response(current_user: models.User, full_transcript: str, device: mo
 
     response = llm_model.generate_content(full_prompt)
     return response.text
-
 
 
 def get_ai_post_processing(transcript_text: str) -> dict:
@@ -315,7 +322,6 @@ def update_user_status(
     for key, value in update_data.items():
         setattr(current_user, key, value)
     db.add(current_user); db.commit(); db.refresh(current_user)
-    print(f"사용자(ID: {current_user.id}) 상태 업데이트 완료: {update_data}")
     return current_user
 
 @app.patch("/users/me", response_model=schemas.User, summary="내 기본 정보 수정 (인증 필요)")
@@ -325,17 +331,11 @@ def update_user_info(
     db: Session = Depends(get_db)
 ):
     update_data = user_update.model_dump(exclude_unset=True)
-
     if not update_data:
         raise HTTPException(status_code=400, detail="업데이트할 내용이 없습니다.")
-
     for key, value in update_data.items():
         setattr(current_user, key, value)
-
-    db.add(current_user)
-    db.commit()
-    db.refresh(current_user)
-
+    db.add(current_user); db.commit(); db.refresh(current_user)
     return current_user
 
 
@@ -359,26 +359,20 @@ def register_device(
     db.add(db_device); db.commit(); db.refresh(db_device)
     return db_device
 
-# 기기 API KEY 인증 API
 @app.post("/devices/verify", summary="기기 API Key 인증")
 def verify_device(body: dict, db: Session = Depends(get_db)):
     device_uid = body.get("device_uid")
     api_key = body.get("api_key")
-
     if not device_uid or not api_key:
         raise HTTPException(status_code=400, detail="device_uid와 api_key가 필요합니다.")
-
     device = db.query(models.Device).filter(
         models.Device.device_uid == device_uid,
         models.Device.api_key == api_key
     ).first()
-
     if not device:
         raise HTTPException(status_code=401, detail="기기 인증 실패")
-
     return {"detail": "기기 인증 성공", "device_id": device.id}
 
-# 기기별 방문 기록 조회
 @app.get("/devices/{device_uid}/visits", response_model=List[schemas.VisitSchema])
 def get_visits_by_device(
     device_uid: str,
@@ -386,20 +380,14 @@ def get_visits_by_device(
     db: Session = Depends(get_db)
 ):
     device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
-
     if not device:
         raise HTTPException(404, "해당 기기를 찾을 수 없습니다.")
-
     if device.user_id != current_user.id:
         raise HTTPException(403, "이 기기 방문 기록을 볼 권한이 없습니다.")
-
     visits = db.query(models.Visit).filter(
         models.Visit.device_id == device.id
     ).order_by(models.Visit.id.desc()).all()
-
     return visits
-
-
 
 @app.get("/devices/me", response_model=List[schemas.Device], summary="내가 등록한 모든 기기 조회")
 def get_my_devices(
@@ -418,34 +406,15 @@ def update_device_memo(
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     db: Session = Depends(get_db)
 ):
-
-    # 1) 해당 uid의 기기 찾기
-    device = db.query(models.Device).filter(
-        models.Device.device_uid == device_uid
-    ).first()
-
+    device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
     if not device:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="해당 기기를 찾을 수 없습니다."
-        )
-    
-    # 2) 로그인한 사용자가 기기의 owner인지 확인
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="해당 기기를 찾을 수 없습니다.")
     if device.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="이 기기를 수정할 권한이 없습니다."
-        )
-
-    # 3) 메모 업데이트
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="이 기기를 수정할 권한이 없습니다.")
     new_memo = memo_data.get("memo")
     device.memo = new_memo
-    
-    db.commit()
-    db.refresh(device)
-
+    db.commit(); db.refresh(device)
     return device
-
 
 @app.get("/devices/{device_uid}", response_model=schemas.Device, summary="특정 기기 상세 조회")
 def get_device_detail(
@@ -453,18 +422,12 @@ def get_device_detail(
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     db: Session = Depends(get_db)
 ):
-    device = db.query(models.Device).filter(
-        models.Device.device_uid == device_uid
-    ).first()
-
+    device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
     if not device:
         raise HTTPException(status_code=404, detail="해당 기기를 찾을 수 없습니다.")
-    
     if device.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="이 기기를 조회할 권한이 없습니다.")
-
     return device
-
 
 @app.patch("/devices/{device_uid}/name", response_model=schemas.Device, summary="기기 이름 수정")
 def update_device_name(
@@ -476,23 +439,14 @@ def update_device_name(
     new_name = body.get("name")
     if not new_name:
         raise HTTPException(status_code=400, detail="name 값이 필요합니다.")
-
-    device = db.query(models.Device).filter(
-        models.Device.device_uid == device_uid
-    ).first()
-
+    device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
     if not device:
         raise HTTPException(status_code=404, detail="해당 기기를 찾을 수 없습니다.")
-    
     if device.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="이 기기를 수정할 권한이 없습니다.")
-
     device.name = new_name
-    db.commit()
-    db.refresh(device)
-
+    db.commit(); db.refresh(device)
     return device
-
 
 @app.delete("/devices/{device_uid}", summary="기기 삭제")
 def delete_device(
@@ -500,20 +454,14 @@ def delete_device(
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     db: Session = Depends(get_db)
 ):
-    device = db.query(models.Device).filter(
-        models.Device.device_uid == device_uid
-    ).first()
-
+    device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
     if not device:
         raise HTTPException(status_code=404, detail="해당 기기를 찾을 수 없습니다.")
-
     if device.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="이 기기를 삭제할 권한이 없습니다.")
-
-    db.delete(device)
-    db.commit()
-
+    db.delete(device); db.commit()
     return {"detail": f"기기({device_uid})가 성공적으로 삭제되었습니다."}
+
 
 # --- 4c. 데이터 조회 API ---
 @app.get("/visits/", response_model=List[schemas.VisitSchema], summary="저장된 방문 기록 조회 (인증 필요)")
@@ -521,7 +469,6 @@ def get_visits(
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     skip: int = 0, limit: int = 10, db: Session = Depends(get_db)
 ):
-    """(프론트엔드) 현재 로그인된 사용자와 연결된 기기들의 방문 기록을 최신순으로 가져옵니다."""
     visits = db.query(models.Visit).join(models.Device).filter(
         models.Device.user_id == current_user.id
     ).order_by(models.Visit.id.desc()).offset(skip).limit(limit).all()
@@ -532,13 +479,11 @@ def get_appointments(
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     db: Session = Depends(get_db)
 ):
-    """(프론트엔드) 현재 로그인된 사용자의 모든 약속/일정을 최신순으로 가져옵니다."""
     appointments = db.query(models.Appointment).filter(
         models.Appointment.user_id == current_user.id
     ).order_by(models.Appointment.start_time.desc()).all()
     return appointments
 
-# 방문 기록 상세 조회
 @app.get("/visits/{visit_id}", response_model=schemas.VisitSchema)
 def get_visit_detail(
     visit_id: int,
@@ -546,13 +491,10 @@ def get_visit_detail(
     db: Session = Depends(get_db)
 ):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
-
     if not visit:
         raise HTTPException(404, "해당 방문 기록을 찾을 수 없습니다.")
-
     if visit.device.user_id != current_user.id:
         raise HTTPException(403, "이 방문 기록을 조회할 권한이 없습니다.")
-
     return visit
 
 @app.get("/visits/{visit_id}/transcript", response_model=schemas.VisitTranscriptResponse)
@@ -562,20 +504,16 @@ def get_visit_transcript(
     db: Session = Depends(get_db)
 ):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
-
     if not visit:
         raise HTTPException(404, "해당 방문 기록이 없습니다.")
-
     if visit.device.user_id != current_user.id:
         raise HTTPException(403, "열람 권한이 없습니다.")
-
     transcripts = (
         db.query(models.Transcript)
         .filter(models.Transcript.visit_id == visit_id)
-        .order_by(models.Transcript.created_at.asc())   # ✅ 수정
+        .order_by(models.Transcript.created_at.asc())
         .all()
     )
-
     return {
         "visit_id": visit.id,
         "summary": visit.summary,
@@ -583,7 +521,6 @@ def get_visit_transcript(
         "transcripts": transcripts,
     }
 
-# 방문 기록 삭제
 @app.delete("/visits/{visit_id}")
 def delete_visit(
     visit_id: int,
@@ -591,16 +528,11 @@ def delete_visit(
     db: Session = Depends(get_db)
 ):
     visit = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
-
     if not visit:
         raise HTTPException(404, "해당 방문 기록이 없습니다.")
-
     if visit.device.user_id != current_user.id:
         raise HTTPException(403, "삭제 권한이 없습니다.")
-
-    db.delete(visit)
-    db.commit()
-
+    db.delete(visit); db.commit()
     return {"detail": "삭제 완료"}
 
 @app.post("/appointments/", response_model=schemas.AppointmentSchema, summary="일정 추가 (인증 필요)")
@@ -614,36 +546,24 @@ def create_appointment(
         start_time=appointment_data.start_time,
         end_time=appointment_data.end_time,
         user_id=current_user.id,
-        visit_id=None  # 사용자가 직접 생성한 일정은 visit과 무관
+        visit_id=None
     )
-
-    db.add(new_appointment)
-    db.commit()
-    db.refresh(new_appointment)
-
+    db.add(new_appointment); db.commit(); db.refresh(new_appointment)
     return new_appointment
 
-
-# 일정 상세 조회
 @app.get("/appointments/{appointment_id}", response_model=schemas.AppointmentSchema)
 def get_appointment_detail(
     appointment_id: int,
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     db: Session = Depends(get_db)
 ):
-    appointment = db.query(models.Appointment).filter(
-        models.Appointment.id == appointment_id
-    ).first()
-
+    appointment = db.query(models.Appointment).filter(models.Appointment.id == appointment_id).first()
     if not appointment:
         raise HTTPException(404, "일정을 찾을 수 없습니다.")
-
     if appointment.user_id != current_user.id:
         raise HTTPException(403, "이 일정을 볼 권한이 없습니다.")
-
     return appointment
 
-# 일정 수정/삭제 API
 @app.patch("/appointments/{appointment_id}", response_model=schemas.AppointmentSchema)
 def update_appointment(
     appointment_id: int,
@@ -651,22 +571,14 @@ def update_appointment(
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     db: Session = Depends(get_db)
 ):
-    appointment = db.query(models.Appointment).filter(
-        models.Appointment.id == appointment_id
-    ).first()
-
+    appointment = db.query(models.Appointment).filter(models.Appointment.id == appointment_id).first()
     if not appointment:
         raise HTTPException(404, "일정을 찾을 수 없습니다.")
-
     if appointment.user_id != current_user.id:
         raise HTTPException(403, "수정 권한이 없습니다.")
-
     for key, value in body.items():
         setattr(appointment, key, value)
-
-    db.commit()
-    db.refresh(appointment)
-
+    db.commit(); db.refresh(appointment)
     return appointment
 
 @app.delete("/appointments/{appointment_id}")
@@ -675,39 +587,48 @@ def delete_appointment(
     current_user: Annotated[models.User, Depends(auth.get_current_user)],
     db: Session = Depends(get_db)
 ):
-    appointment = db.query(models.Appointment).filter(
-        models.Appointment.id == appointment_id
-    ).first()
-
+    appointment = db.query(models.Appointment).filter(models.Appointment.id == appointment_id).first()
     if not appointment:
         raise HTTPException(404, "일정을 찾을 수 없습니다.")
-
     if appointment.user_id != current_user.id:
         raise HTTPException(403, "삭제 권한이 없습니다.")
-
-    db.delete(appointment)
-    db.commit()
-
+    db.delete(appointment); db.commit()
     return {"detail": "일정 삭제 완료"}
+
 
 # --- 5. WebSocket API 엔드포인트 ---
 
 # 5a. 실시간 영상
-@app.websocket("/ws/stream/{device_id}")
-async def websocket_stream(websocket: WebSocket, device_id: int):
-    """(프론트엔드) 이 주소로 연결하여 실시간 영상을 '수신'합니다."""
-    await video_manager.connect(device_id, websocket)
-    print(f"새로운 시청자(앱)가 Device {device_id} 스트림에 연결했습니다.")
+@app.websocket("/ws/stream/{device_uid}") # 1. 입력값을 device_id(int)에서 device_uid(str)로 변경
+async def websocket_stream(websocket: WebSocket, device_uid: str, db: Session = Depends(get_db)):
+    """
+    앱에서 device_uid(예: "1234")로 접속하면, 
+    서버가 내부적으로 device_id(예: 1)를 찾아 연결해 줍니다.
+    """
+    # 2. DB에서 UID로 실제 기기 정보를 조회
+    device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
+    
+    if not device:
+        # 기기가 없으면 연결 거부
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid device UID")
+        return
+
+    # 3. 실제 DB ID(pk)를 사용하여 매니저에 연결
+    real_device_id = device.id
+    await video_manager.connect(real_device_id, websocket)
+    
+    print(f"📱 앱(시청자) 연결됨: UID={device_uid} -> DB_ID={real_device_id}")
+    
     try:
         while True:
-            await websocket.receive_text() # 연결 유지를 위해 대기
+            # 연결 유지를 위한 대기 (앱에서 데이터를 보낼 일은 없으므로)
+            await websocket.receive_text() 
     except WebSocketDisconnect:
-        video_manager.disconnect(device_id, websocket)
-        print(f"시청자(앱)가 Device {device_id} 스트림에서 연결 해제되었습니다.")
+        video_manager.disconnect(real_device_id, websocket)
+        print(f"👋 앱(시청자) 연결 해제: UID={device_uid}")
 
 @app.websocket("/ws/broadcast/{device_uid}")
 async def websocket_broadcast(websocket: WebSocket, device_uid: str, db: Session = Depends(get_db)):
-    """(임베디드) 이 주소로 연결하여 실시간 영상을 '송출'합니다."""
     device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
     if not device:
         await websocket.accept()
@@ -724,16 +645,16 @@ async def websocket_broadcast(websocket: WebSocket, device_uid: str, db: Session
         print(f"기기(ID: {device.id})의 영상 송출이 중단되었습니다.")
 
 
-# 5b. ★★★ 실시간 대화 (신규 WebSocket API) ★★★
+# 5b. ★★★ 실시간 대화 (수정됨: 비동기 처리 강화) ★★★
 @app.websocket("/ws/conversation/{device_uid}")
 async def websocket_conversation(websocket: WebSocket, device_uid: str):
     """
     라즈베리파이 ↔ 서버 ↔ 사용자(웹, 앱)를 연결하는 실시간 대화 WebSocket.
-    - 방문자의 음성을 라즈베리파이에서 보내면: 서버가 AI로 응답하여 음성 전송
-    - 사용자가 웹에서 텍스트를 보내면: 그 텍스트를 음성 변환하여 방문자에게 전달
+    Blocking I/O(Whisper, LLM, TTS)를 스레드 풀에서 실행하여 이벤트 루프 차단을 방지합니다.
     """
     await websocket.accept()
     db = SessionLocal()  # DB 세션 생성
+    loop = asyncio.get_event_loop() # 비동기 루프 가져오기
 
     # 1️⃣ Device 인증
     device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
@@ -742,15 +663,15 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
         db.close()
         return
 
-    user = device.owner  # 기기를 소유한 사용자
+    user = device.owner
     print(f"📡 {user.full_name}님의 기기로부터 대화 연결 중... (device_id: {device.id})")
 
-    # 2️⃣ Visit 생성 (방문 기록)
+    # 2️⃣ Visit 생성
     visit = models.Visit(device_id=device.id, summary="대화 중...")
     db.add(visit); db.commit(); db.refresh(visit)
     print(f"📝 방문 기록 생성됨 (visit_id: {visit.id})")
 
-    # 🔔 사용자에게 푸시 알림 보내기 (방문 발생 알림)
+    # 🔔 푸시 알림
     notify_user(
         user_id=device.user_id,
         title="방문자 감지",
@@ -758,26 +679,34 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
         db=db,
     )
 
-    transcript_log = ""  # 전체 대화 텍스트 저장
+    transcript_log = ""
 
     try:
-        # 3️⃣ AI의 첫 응답 (방문자 벨 누름 시나리오)
+        # 3️⃣ AI의 첫 응답
         greeting = "방문객: (초인종 소리)"
         transcript_log += greeting + "\n"
-        ai_reply = get_llm_response(user, greeting, device=device)
+
+        # ★ Blocking 방지: AI 응답 생성
+        ai_reply = await loop.run_in_executor(
+            None, 
+            lambda: get_llm_response(user, greeting, db=db, device=device)
+        )
         transcript_log += f"AI: {ai_reply}\n"
 
         # DB 저장
         db.add(models.Transcript(visit_id=visit.id, speaker="ai", message=ai_reply))
         db.commit()
 
-        # 🔊 TTS 변환해서 방문자에게 전송
+        # ★ Blocking 방지 & 파일 관리: TTS 생성 및 전송
         temp_audio = f"ai_greeting_{uuid.uuid4()}.mp3"
-        text_to_speech(ai_reply, temp_audio)
-        with open(temp_audio, "rb") as f:
-            await websocket.send_bytes(f.read())
-        os.remove(temp_audio)
-        print("🗣️ AI 첫 인사 전송 완료")
+        try:
+            await loop.run_in_executor(None, text_to_speech, ai_reply, temp_audio)
+            with open(temp_audio, "rb") as f:
+                await websocket.send_bytes(f.read())
+            print("🗣️ AI 첫 인사 전송 완료")
+        finally:
+            if os.path.exists(temp_audio):
+                os.remove(temp_audio)
 
         # 4️⃣ 대화 Loop
         while True:
@@ -786,6 +715,7 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
             except Exception as e:
                 print(f"⚠️ WebSocket Receive Error: {e}")
                 break
+            
             # 🟡 사용자(앱)의 텍스트 메시지를 받았을 때
             if "text" in incoming:
                 user_text = incoming["text"]
@@ -795,51 +725,65 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
 
                 print(f"💬 [사용자] '{user_text}'")
 
-                # 사용자 메시지 저장
                 transcript_log += f"User: {user_text}\n"
                 db.add(models.Transcript(visit_id=visit.id, speaker="user", message=user_text))
                 db.commit()
 
-                # 방문자에게 대신 전달 (TTS)
+                # ★ TTS 전송 (Blocking 방지 + 파일 정리)
                 tmp_user_audio = f"user_input_{uuid.uuid4()}.mp3"
-                text_to_speech(user_text, tmp_user_audio)
-                with open(tmp_user_audio, "rb") as f:
-                    await websocket.send_bytes(f.read())
-                os.remove(tmp_user_audio)
+                try:
+                    await loop.run_in_executor(None, text_to_speech, user_text, tmp_user_audio)
+                    with open(tmp_user_audio, "rb") as f:
+                        await websocket.send_bytes(f.read())
+                finally:
+                    if os.path.exists(tmp_user_audio):
+                        os.remove(tmp_user_audio)
                 continue
 
             # 🔵 라즈베리파이에서 음성 데이터가 들어왔을 때
             if "bytes" in incoming:
                 visitor_audio = incoming["bytes"]
                 tmp_voice = f"raw_voice_{uuid.uuid4()}.mp3"
-                with open(tmp_voice, "wb") as f:
-                    f.write(visitor_audio)
+                
+                try:
+                    with open(tmp_voice, "wb") as f:
+                        f.write(visitor_audio)
 
-                # STT
-                visitor_text = stt_pipe(tmp_voice)["text"]
-                os.remove(tmp_voice)
+                    # ★ Blocking 방지: STT 변환
+                    visitor_text = await loop.run_in_executor(
+                        None, 
+                        lambda: stt_pipe(tmp_voice)["text"]
+                    )
+                finally:
+                    if os.path.exists(tmp_voice):
+                        os.remove(tmp_voice)
+
                 print(f"🗣️ [방문자] '{visitor_text}'")
 
                 transcript_log += f"Visitor: {visitor_text}\n"
                 db.add(models.Transcript(visit_id=visit.id, speaker="visitor", message=visitor_text))
                 db.commit()
 
-                # LLM → AI 응답 생성
-                ai_reply = get_llm_response(user, transcript_log, device=device)
+                # ★ Blocking 방지: LLM 응답 생성
+                ai_reply = await loop.run_in_executor(
+                    None, 
+                    lambda: get_llm_response(user, transcript_log, db=db, device=device)
+                )
                 transcript_log += f"AI: {ai_reply}\n"
                 print(f"🤖 [AI 응답] '{ai_reply}'")
 
-                # DB 저장
                 db.add(models.Transcript(visit_id=visit.id, speaker="ai", message=ai_reply))
                 db.commit()
 
-                # TTS → 방문자에게 전송
+                # ★ TTS 전송 (Blocking 방지 + 파일 정리)
                 tmp_ai_audio = f"ai_reply_{uuid.uuid4()}.mp3"
-                text_to_speech(ai_reply, tmp_ai_audio)
-
-                with open(tmp_ai_audio, "rb") as f:
-                    await websocket.send_bytes(f.read())
-                os.remove(tmp_ai_audio)
+                try:
+                    await loop.run_in_executor(None, text_to_speech, ai_reply, tmp_ai_audio)
+                    with open(tmp_ai_audio, "rb") as f:
+                        await websocket.send_bytes(f.read())
+                finally:
+                    if os.path.exists(tmp_ai_audio):
+                        os.remove(tmp_ai_audio)
 
     except WebSocketDisconnect:
         print("⚠️ 기기 연결 끊김")
@@ -853,7 +797,6 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
         visit.summary = post_data.get("summary", "요약 생성 실패")
         db.add(visit)
 
-        # 일정이 생성된 경우 Appointment DB에 저장
         appointment = post_data.get("appointment")
         if appointment is not None:
             try:
@@ -873,7 +816,6 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
         db.commit()
         print(f"📌 방문 요약 저장 완료: {visit.summary}")
         
-        # 🔔 종료 알림 전송
         notify_user(
             user_id=user.id,
             title="대화 종료",
@@ -883,11 +825,6 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
 
         db.close()
 
-        
-        
-        
-
-# FCM 토큰
 @app.post("/users/me/push-token")
 def save_push_token(
     body: dict,
@@ -895,24 +832,19 @@ def save_push_token(
     db: Session = Depends(get_db)
 ):
     token = body.get("token")
-
     if not token:
         raise HTTPException(400, "token 필드가 필요합니다.")
-
     current_user.push_token = token
     db.commit()
-
     return {"detail": "토큰 저장 완료"}
 
 @app.post("/notify")
 def send_push(body: dict):
-    token = body.get("token")  # 받는 사용자 FCM Token
+    token = body.get("token")
     title = body.get("title", "새 방문자")
     message = body.get("message", "초인종이 눌렸습니다.")
-
     if not token:
         raise HTTPException(400, "token이 필요합니다.")
-
     message_obj = messaging.Message(
         notification=messaging.Notification(
             title=title,
@@ -920,7 +852,6 @@ def send_push(body: dict):
         ),
         token=token,
     )
-
     response = messaging.send(message_obj)
     return {"detail": "푸시 전송 성공", "response": response}
 
@@ -928,5 +859,4 @@ def send_push(body: dict):
 # --- 6. 서버 실행 ---
 if __name__ == "__main__":
     import uvicorn
-    # 터미널에서 `docker-compose up`으로 실행
     uvicorn.run(app, host="0.0.0.0", port=8000)
