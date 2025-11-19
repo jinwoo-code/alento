@@ -1,0 +1,26 @@
+# Python 캐시
+__pycache__/
+*.pyc
+
+# 환경 변수
+.env
+
+# 비밀키 (절대 올리지 말 것)
+gcs-key.json
+firebase_admin_key.json
+
+# 기타 로컬 파일
+response.mp3
+EOF# Python 캐시
+__pycache__/
+*.pyc
+
+# 환경 변수
+.env
+
+# 비밀키 (절대 올리지 말 것)
+gcs-key.json
+firebase_admin_key.json
+
+# 기타 로컬 파일
+response.mp3

@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      ALGORITHM: ${ALGORITHM}
+
+      # 🔥 Firebase 인증 JSON 파일 경로
+      GOOGLE_APPLICATION_CREDENTIALS: /app/firebase_admin_key.json
+
+      # 🔥 GCS 버킷 이름
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME}
+    volumes:
+      - ./firebase_admin_key.json:/app/firebase_admin_key.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  db:
+    image: mysql:8.0
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    environment:
+      MYSQL_DATABASE: doorbell_db
+      MYSQL_USER: doorbell_user
+      MYSQL_PASSWORD: ${DATABASE_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+
+volumes:
+  mysql_data:

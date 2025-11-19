@@ -1,0 +1,19 @@
+# requirements.txt
+fastapi
+uvicorn
+sqlalchemy
+pymysql
+python-dotenv
+google-generativeai
+gtts
+google-cloud-storage
+passlib==1.7.4  # ★★★ 1. passlib 버전 고정
+python-jose
+bcrypt==3.2.0
+transformers
+websockets
+opencv-python-headless
+watchfiles
+cryptography
+python-multipart
+firebase-admin==6.2.0
