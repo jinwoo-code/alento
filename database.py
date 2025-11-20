@@ -9,7 +9,16 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-engine = create_engine(DATABASE_URL)
+# engine = create_engine(DATABASE_URL)
+
+# # DB 터지면
+engine = create_engine(
+    DATABASE_URL, 
+    pool_size=20,       # 기본 연결 수 늘리기 (기본 5 -> 20)
+    max_overflow=40,    # 돌발 시 추가 허용 수 (기본 10 -> 40)
+    pool_recycle=1800   # 연결 갱신 주기
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
