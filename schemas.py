@@ -98,8 +98,11 @@ class VisitSchema(BaseModel):
     visitor_photo_url: str | None = None
     visitor_audio_url: str | None = None
     ai_response_audio_url: str | None = None
+    
+    # [추가] 프론트엔드에 보낼 필드
+    visitor_video_url: str | None = None 
+    
     created_at: datetime.datetime
-
     transcripts: List[TranscriptSchema] = []
 
     model_config = {

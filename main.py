@@ -7,7 +7,7 @@ import asyncio
 from typing import List, Annotated
 
 from fastapi import (
-    FastAPI, UploadFile, File, HTTPException, Depends, status,
+    FastAPI, UploadFile, File, Form, HTTPException, Depends, status,
     WebSocket, WebSocketDisconnect
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -716,23 +716,57 @@ async def websocket_conversation(websocket: WebSocket, device_uid: str):
         print("✅ 종료 완료")
 
 # main.py 에 추가 필수
+# main.py 의 upload_file 함수 교체
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(
+    file: UploadFile = File(...), 
+    device_uid: str = Form(...),  # [추가] 라즈베리파이가 UID를 같이 보내줘야 함
+    db: Session = Depends(get_db) # [추가] DB 연결
+):
+    """
+    영상을 GCS에 업로드하고, 해당 기기의 '가장 최근 방문 기록'에 URL을 저장합니다.
+    """
     try:
-        filename = f"snapshot_{uuid.uuid4()}.jpg" # 확장자는 임의로 jpg
+        # 1. GCS 업로드 (기존 로직)
+        file_ext = file.filename.split(".")[-1] if "." in file.filename else "bin"
+        folder = "videos" if file_ext in ["mp4", "avi"] else "snapshots"
+        filename = f"{uuid.uuid4()}.{file_ext}"
+        
         with open(filename, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
         loop = asyncio.get_event_loop()
         gcs_url = await loop.run_in_executor(
-            None, upload_to_gcs, filename, f"snapshots/{filename}"
+            None, upload_to_gcs, filename, f"{folder}/{filename}"
         )
+        
         if os.path.exists(filename): os.remove(filename)
-        return {"url": gcs_url}
-    except Exception:
-        return {"url": None}
+        if not gcs_url: return {"error": "GCS upload failed", "url": None}
 
+        # 2. [핵심 추가] DB에 URL 업데이트
+        # 해당 UID를 가진 기기를 찾음
+        device = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
+        if device:
+            # 그 기기의 '가장 최근' 방문 기록을 찾음
+            last_visit = db.query(models.Visit).filter(
+                models.Visit.device_id == device.id
+            ).order_by(models.Visit.id.desc()).first()
+            
+            if last_visit:
+                last_visit.visitor_video_url = gcs_url
+                db.commit()
+                print(f"✅ DB 업데이트 완료 (Visit ID: {last_visit.id}) -> {gcs_url}")
+            else:
+                print("⚠️ 방문 기록이 없어서 영상 URL을 DB에 넣지 못했습니다.")
+        else:
+            print(f"⚠️ 알 수 없는 기기 UID: {device_uid}")
+
+        return {"url": gcs_url}
+
+    except Exception as e:
+        print(f"❌ 업로드 에러: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 # --- 서버 실행 ---
 if __name__ == "__main__":
     import uvicorn

@@ -58,6 +58,9 @@ class Visit(Base):
     visitor_photo_url = Column(String(1024), nullable=True)
     visitor_audio_url = Column(String(1024), nullable=True)
     ai_response_audio_url = Column(String(1024), nullable=True)
+    
+    visitor_video_url = Column(String(1024), nullable=True)
+    
     created_at = Column(DateTime, nullable=False, default=now)
     updated_at = Column(DateTime, nullable=False, default=now, onupdate=now)
     
