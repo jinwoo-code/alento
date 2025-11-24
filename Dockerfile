@@ -4,8 +4,10 @@
 FROM python:3.10-slim
 
 # 2. Whisper(STT)에 필요한 FFmpeg를 설치합니다.
-RUN apt-get update && apt-get install -y ffmpeg
-
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libsndfile1
+    
 # 3. 컨테이너 내부의 작업 폴더를 만듭니다.
 WORKDIR /app
 

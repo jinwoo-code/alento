@@ -1,4 +1,4 @@
-# models.py (api_key가 추가된 최종 코드)
+# models.py (최종 수정본: visit_id nullable=True 적용)
 
 from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, func
 from sqlalchemy.orm import relationship
@@ -29,20 +29,11 @@ class Device(Base):
     __tablename__ = "devices"
     
     id = Column(Integer, primary_key=True, index=True)
-
-    # 기기 고유 식별자(라즈베리파이에 박힌 고유 UID 등)
     device_uid = Column(String(255), unique=True, index=True, nullable=False)
-
-    # 기기 인증 키 (반드시 유지)
     api_key = Column(String(255), unique=True, index=True, nullable=False)
-
     name = Column(String(100), nullable=False, default="My Doorbell")
-
-    # 🔥 새로 추가되는 기기별 메모
     memo = Column(Text, nullable=True)
-
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-
     created_at = Column(DateTime, nullable=False, default=now)
     updated_at = Column(DateTime, nullable=False, default=now, onupdate=now)
 
@@ -88,7 +79,10 @@ class Appointment(Base):
     end_time = Column(DateTime, nullable=True)
     status = Column(String(50), nullable=False, default="SCHEDULED")
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    visit_id = Column(Integer, ForeignKey("visits.id"), nullable=False)
+    
+    # [수정됨] nullable=True 로 변경했습니다.
+    visit_id = Column(Integer, ForeignKey("visits.id"), nullable=True)
+    
     created_at = Column(DateTime, nullable=False, default=now)
     updated_at = Column(DateTime, nullable=False, default=now, onupdate=now)
     

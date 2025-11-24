@@ -17,3 +17,5 @@ watchfiles
 cryptography
 python-multipart
 firebase-admin==6.2.0
+soundfile
+numpy
