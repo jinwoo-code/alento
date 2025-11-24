@@ -2,11 +2,11 @@ import os
 import shutil
 import uuid
 import json
-import datetime
 import asyncio
 from typing import List, Annotated
+import datetime as dt
 from datetime import datetime
-
+import cv2
 
 import numpy as np
 import soundfile as sf
@@ -45,10 +45,8 @@ AUDIO_SAMPLE_RATE = 48000
 AUDIO_CHANNELS = 1
 
 # --- 1. 초기 설정 ---
-models.Base.metadata.create_all(bind=engine)
 load_dotenv()
 
-active_conversations = {}
 
 tags_metadata = [
     {"name": "System", "description": "시스템 상태 확인"},
@@ -75,7 +73,9 @@ system_instruction = ""
 # --- VAD globals ---
 vad_model = None
 vad_utils = None
-active_conversations = set()   # 중복 ws 연결 방지용
+active_conversations_ws: dict[str, WebSocket] = {}   # 실제 소켓 저장용
+active_conversation_devices: set[str] = set()       # 중복 방지용(필요하면)
+
 
 origins = [
     "http://localhost",
@@ -95,7 +95,7 @@ app.add_middleware(
 
 # [헬퍼] 한국 시간(KST) 구하기
 def get_kst_now():
-    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    return dt.datetime.utcnow() + dt.timedelta(hours=9)
 
 # --- 2. 헬퍼 함수 및 클래스 ---
 
@@ -162,6 +162,12 @@ def startup_event():
     global storage_client, bucket, stt_pipe, llm_model, system_instruction
     global vad_model, vad_utils
 
+    try:
+        models.Base.metadata.create_all(bind=engine)
+        print("DB tables ensured.")
+    except Exception as e:
+        print("DB create_all failed:", e)
+    
     # Firebase
     try:
         cred = credentials.Certificate(os.getenv("FIREBASE_ADMIN_KEY", "firebase_admin_key.json"))
@@ -185,7 +191,7 @@ def startup_event():
     print("Loading AI Models...")
 
     # ✅ STT (Whisper)
-    device = "cpu"
+    device = -1
     stt_pipe = pipeline(
         "automatic-speech-recognition",
         model="openai/whisper-small",
@@ -317,13 +323,28 @@ def vad_split_segments(
 
     # ✅ silero 공식 util로 말 구간 추출 → list 반환 (여기서 item() 쓰면 안됨)
     speech_ts = get_speech_timestamps(
-        audio_16k_torch,
-        vad_model,
-        sampling_rate=tgt_sr
-    )
+    audio_16k_torch,
+    vad_model,
+    sampling_rate=tgt_sr,
+    threshold=0.5,                 # 기본(0.5)보다 낮으면 더 민감. 너무 잘게 쪼개지면 0.55~0.6도 시도
+    min_speech_duration_ms=400,    # ✅ 0.4초 이하는 말로 안봄
+    min_silence_duration_ms=250,   # ✅ 0.25초 이하는 끊김으로 안봄(붙여줌)
+    speech_pad_ms=150              # ✅ 앞뒤 150ms 패딩
+)
+    merged = []
+    gap_thresh = int(0.3 * tgt_sr)  # 300ms
+    for ts in speech_ts:
+        if not merged:
+            merged.append(ts)
+            continue
+        prev = merged[-1]
+        if ts["start"] - prev["end"] <= gap_thresh:
+            prev["end"] = ts["end"]
+        else:
+            merged.append(ts)
 
     segments = []
-    for ts in speech_ts:
+    for ts in merged:   # ✅ 여기서 merged 사용
         start, end = ts["start"], ts["end"]
         seg_float = audio_16k[start:end].copy()
         seg_int16 = (seg_float * 32768.0).astype(np.int16)
@@ -372,10 +393,18 @@ def update_user_info(user_update: schemas.UserUpdate, current_user: Annotated[mo
     return current_user
 
 @app.post("/users/me/push-token", tags=["User"])
-def save_push(body: dict, current_user: Annotated[models.User, Depends(auth.get_current_user)], db: Session = Depends(get_db)):
-    current_user.push_token = body.get("token")
+def save_push(
+    body: dict,
+    current_user: Annotated[models.User, Depends(auth.get_current_user)],
+    db: Session = Depends(get_db),
+):
+    token = body.get("token")
+    if not token:
+        raise HTTPException(400, "token field required")
+
+    current_user.push_token = token
     db.commit()
-    return {"detail": "OK"}
+    return {"detail": "OK", "token_saved": True}
 
 # --- [Device] ---
 @app.post("/devices/register", response_model=schemas.DeviceRegisterResponse, tags=["Device"])
@@ -533,16 +562,24 @@ def save_frames_to_mp4(device_uid, frames):
     filename = f"./temp/visit_{device_uid}_{timestamp()}.mp4"
     os.makedirs("./temp", exist_ok=True)
 
-    out = cv2.VideoWriter(filename, fourcc, 15, (320, 240))
+    out = None
 
     for jpg_bytes in frames:
         arr = np.frombuffer(jpg_bytes, np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is not None:
-            out.write(frame)
+        if frame is None:
+            continue
 
-    out.release()
+        if out is None:
+            h, w = frame.shape[:2]
+            out = cv2.VideoWriter(filename, fourcc, 15, (w, h))
+
+        out.write(frame)
+
+    if out:
+        out.release()
     return filename
+
 
 def timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -582,93 +619,78 @@ async def ws_stream(websocket: WebSocket, device_uid: str, db: Session = Depends
 
 active_video_streams = {}
 
-@app.websocket("/ws/conversation/{device_uid}")
-async def conversation_socket(websocket: WebSocket, device_uid: str):
+@app.websocket("/ws/broadcast/{device_uid}")
+async def broadcast_socket(websocket: WebSocket, device_uid: str):
     await websocket.accept()
 
-    # 중복 연결 방지
-    if device_uid in active_conversations:
-        print(f"⚠️ Duplicate WS for {device_uid} → closing")
-        try: await active_conversations[device_uid].close()
-        except: pass
-    active_conversations[device_uid] = websocket
+    if device_uid in active_video_streams:
+        try:
+            await active_video_streams[device_uid].close()
+        except:
+            pass
 
-    visit = None
-    audio_chunks = []
+    active_video_streams[device_uid] = websocket
+    frames = []
 
-    print(f"📡 Camera connected: {device_uid}")
+    print(f"🎥 Broadcast connected: {device_uid}")
 
     try:
         while True:
-            try:
-                msg = await websocket.receive()
-            except WebSocketDisconnect:
-                print("🔌 disconnect")
-                break
-            except Exception as e:
-                print("receive error:", e)
+            msg = await websocket.receive()
+
+            # ✅ disconnect 타입이면 바로 탈출
+            if msg["type"] == "websocket.disconnect":
+                print("🎥 Video WS disconnect msg received")
                 break
 
-            if msg["type"] == "websocket.receive":
+            jpg = msg.get("bytes")
+            if jpg:
+                frames.append(jpg)
 
-                # TEXT
-                if "text" in msg:
-                    t = msg["text"]
-                    if "handshake" in t:
-                        print("🤝 handshake ignored")
-                        continue
+                # 실시간 뷰어 broadcast
+                db = SessionLocal()
+                try:
+                    dev = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
+                    if dev:
+                        await video_manager.broadcast_to_device_viewers(dev.id, jpg)
+                finally:
+                    db.close()
 
-                # BINARY (audio)
-                if "bytes" in msg and msg["bytes"]:
-                    
-                    # Visit 생성은 오직 여기서!
-                    if visit is None:
-                        db = SessionLocal()
-                        dev = db.query(models.Device).filter(
-                            models.Device.device_uid == device_uid
-                        ).first()
-
-                        visit = models.Visit(
-                            device_id=dev.id,
-                            created_at=get_kst_now(),
-                        )
-                        db.add(visit); db.commit(); db.refresh(visit)
-                        print(f"📞 Visit {visit.id} Start")
-                        db.close()
-
-                    audio_chunks.append(msg["bytes"])
+    except WebSocketDisconnect:
+        print("🎥 Video WS disconnected (exception)")
 
     finally:
-        print(f"💾 visit end → saving audio")
-        active_conversations.pop(device_uid, None)
+        active_video_streams.pop(device_uid, None)
+        if frames:
+            mp4_path = save_frames_to_mp4(device_uid, frames)
+            url = upload_to_gcs(mp4_path, f"videos/{device_uid}_{timestamp()}.mp4")
+            print("📦 Video uploaded:", url)
 
-        if visit and audio_chunks:
-            wav_path = save_pcm_to_wav(visit.id, audio_chunks)
-            url = upload_to_gcs(wav_path, f"audio/visit_{visit.id}.wav")
 
-            db = SessionLocal()
-            visit_obj = db.query(models.Visit).filter(models.Visit.id == visit.id).first()
-            visit_obj.visitor_audio_url = url
-            visit_obj.end_time = get_kst_now()
-            db.commit()
-            db.close()
-
-            print("✅ Audio uploaded:", url)
-
+@app.websocket("/ws/conversation/{device_uid}")
 async def ws_conversation(websocket: WebSocket, device_uid: str):
-    global active_conversations
+    global active_conversations_ws, active_conversation_devices
 
-    # ✅ 중복 연결 방지
-    if device_uid in active_conversations:
-        await websocket.close(1013)  # Try again later
-        print(f"⚠️ Duplicate conversation rejected: {device_uid}")
-        return
-    active_conversations.add(device_uid)
+    # =========================
+    # 0) 중복 연결 정리
+    # =========================
+    if device_uid in active_conversation_devices:
+        try:
+            old_ws = active_conversations_ws.get(device_uid)
+            if old_ws:
+                await old_ws.close()
+        except:
+            pass
+
+    active_conversation_devices.add(device_uid)
+    active_conversations_ws[device_uid] = websocket
 
     await websocket.accept()
     loop = asyncio.get_event_loop()
 
-    # --- 1) Visit 생성 ---
+    # =========================
+    # 1) Visit 생성
+    # =========================
     db = SessionLocal()
     try:
         dev = db.query(models.Device).filter(models.Device.device_uid == device_uid).first()
@@ -689,11 +711,24 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
     print(f"📞 Visit {visit_id} Start")
 
     transcript = ""
-    pcm_buffer: List[bytes] = []   # ✅ 연속 PCM chunk 누적
-    visitor_audio_segments_for_save: List[np.ndarray] = []  # ✅ 방문자만 저장용
+
+    # 서버로 들어오는 PCM chunk 모음
+    pcm_buffer: List[bytes] = []
+
+    # ✅ VAD로 잘라낸 “말 구간”만 저장할 리스트
+    visitor_audio_segments_for_save: List[np.ndarray] = []
+
+    # ✅ 원본 전체 PCM 저장 fallback 용
+    all_pcm_for_save: List[bytes] = []
+
+    # ====== VAD 윈도우/오버랩 설정 ======
+    WINDOW_CHUNKS = 64        # (중요) 32는 너무 짧음. 48k/1024 기준 1.36초
+    OVERLAP_CHUNKS = 8
 
     try:
-        # --- 2) AI 첫 인사 ---
+        # =========================
+        # 2) AI 첫 인사
+        # =========================
         greeting = "방문객: (벨소리)"
         transcript += greeting + "\n"
 
@@ -707,7 +742,12 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
             )
 
             try:
-                db.add(models.Transcript(visit_id=visit_id, speaker="ai", message=ai_text, created_at=get_kst_now()))
+                db.add(models.Transcript(
+                    visit_id=visit_id,
+                    speaker="ai",
+                    message=ai_text,
+                    created_at=get_kst_now()
+                ))
                 db.commit()
             except:
                 db.rollback()
@@ -718,22 +758,43 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
 
         tmp = f"tmp_{uuid.uuid4()}.mp3"
         await loop.run_in_executor(None, text_to_speech, ai_text, tmp)
-        with open(tmp, "rb") as f:
-            await websocket.send_bytes(f.read())
-        if os.path.exists(tmp): os.remove(tmp)
+        try:
+            with open(tmp, "rb") as f:
+                await websocket.send_bytes(f.read())
+        except WebSocketDisconnect:
+            print("⚠️ Pi disconnected before first AI audio send")
+            return
+        except RuntimeError:
+            print("⚠️ websocket already closed")
+            return
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
-        # --- 3) 대화 루프 ---
+        # =========================
+        # 3) 대화 루프
+        # =========================
         while True:
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                print("🔌 disconnect (exception)")
+                break
 
+            # starlette가 disconnect message를 직접 주는 경우 방어
+            if msg.get("type") == "websocket.disconnect":
+                print("🔌 disconnect msg received")
+                break
+
+            # -------------------------
             # A) 텍스트(User->Pi)
-            if "text" in msg:
+            # -------------------------
+            if "text" in msg and msg["text"] is not None:
                 text = msg["text"]
 
                 if "handshake" in text or text.strip().startswith("{"):
                     print(f"🤝 설정 메시지 무시: {text}")
                     continue
-
                 if text == "end":
                     break
 
@@ -741,36 +802,41 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
 
                 db = SessionLocal()
                 try:
-                    try:
-                        db.add(models.Transcript(visit_id=visit_id, speaker="user", message=text, created_at=get_kst_now()))
-                        db.commit()
-                    except:
-                        db.rollback()
+                    db.add(models.Transcript(
+                        visit_id=visit_id,
+                        speaker="user",
+                        message=text,
+                        created_at=get_kst_now()
+                    ))
+                    db.commit()
+                except:
+                    db.rollback()
                 finally:
                     db.close()
 
-                tmp = f"tmp_{uuid.uuid4()}.mp3"
-                await loop.run_in_executor(None, text_to_speech, text, tmp)
-                with open(tmp, "rb") as f:
-                    await websocket.send_bytes(f.read())
-                if os.path.exists(tmp): os.remove(tmp)
-
+            # -------------------------
             # B) 음성(Pi->Server) continuous PCM
-            if "bytes" in msg:
-                audio_bytes = msg["bytes"]
-                pcm_buffer.append(audio_bytes)
+            # -------------------------
+            if "bytes" in msg and msg["bytes"]:
+                chunk = msg["bytes"]
+                pcm_buffer.append(chunk)
 
-                # ✅ 버퍼가 충분히 쌓였을 때만 VAD 돌려서 STT
-                # 4096 * 8 chunks ≈ 0.68s @48kHz
-                if len(pcm_buffer) < 8:
+                # ✅ 원본 전체 저장용에도 누적
+                all_pcm_for_save.append(chunk)
+
+                # 윈도우가 안 찼으면 계속 누적
+                if len(pcm_buffer) < WINDOW_CHUNKS:
                     continue
 
+                # 윈도우가 찼을 때만 VAD/STT
                 segments = vad_split_segments(pcm_buffer, src_sr=48000, tgt_sr=16000)
-                pcm_buffer.clear()
+
+                # tail(overlap)만 남기기
+                pcm_buffer = pcm_buffer[-OVERLAP_CHUNKS:]
 
                 for seg_int16 in segments:
-                    # seg_int16은 이미 말 구간만 있음
-                    if len(seg_int16) < 1600:  # 너무 짧은 말(0.1s 이하) skip
+                    # 너무 짧은 말은 skip
+                    if len(seg_int16) < 1600:
                         continue
 
                     visitor_audio_segments_for_save.append(seg_int16)
@@ -778,13 +844,16 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
                     tmp_in = f"in_{uuid.uuid4()}.wav"
                     sf.write(tmp_in, seg_int16, 16000)
 
-                    stt_text = await loop.run_in_executor(None, lambda: stt_pipe(tmp_in)["text"])
-                    if os.path.exists(tmp_in): os.remove(tmp_in)
+                    stt_text = await loop.run_in_executor(
+                        None, lambda: stt_pipe(tmp_in)["text"]
+                    )
+                    if os.path.exists(tmp_in):
+                        os.remove(tmp_in)
 
-                    print(f"🗣️ STT: {stt_text}")
                     if not stt_text.strip():
                         continue
 
+                    print(f"🗣️ STT: {stt_text}")
                     transcript += f"Visitor: {stt_text}\n"
 
                     db = SessionLocal()
@@ -792,21 +861,27 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
                         u = db.query(models.User).filter(models.User.id == user_id).first()
                         d = db.query(models.Device).filter(models.Device.id == dev_id).first()
 
-                        try:
-                            db.add(models.Transcript(visit_id=visit_id, speaker="visitor", message=stt_text, created_at=get_kst_now()))
-                            db.commit()
-                        except:
-                            db.rollback()
+                        db.add(models.Transcript(
+                            visit_id=visit_id,
+                            speaker="visitor",
+                            message=stt_text,
+                            created_at=get_kst_now()
+                        ))
+                        db.commit()
 
                         ai_text = await loop.run_in_executor(
                             None, lambda: get_llm_response(u, transcript, db=db, device=d)
                         )
 
-                        try:
-                            db.add(models.Transcript(visit_id=visit_id, speaker="ai", message=ai_text, created_at=get_kst_now()))
-                            db.commit()
-                        except:
-                            db.rollback()
+                        db.add(models.Transcript(
+                            visit_id=visit_id,
+                            speaker="ai",
+                            message=ai_text,
+                            created_at=get_kst_now()
+                        ))
+                        db.commit()
+                    except:
+                        db.rollback()
                     finally:
                         db.close()
 
@@ -814,9 +889,18 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
 
                     tmp = f"tmp_{uuid.uuid4()}.mp3"
                     await loop.run_in_executor(None, text_to_speech, ai_text, tmp)
-                    with open(tmp, "rb") as f:
-                        await websocket.send_bytes(f.read())
-                    if os.path.exists(tmp): os.remove(tmp)
+                    try:
+                        with open(tmp, "rb") as f:
+                            await websocket.send_bytes(f.read())
+                    except WebSocketDisconnect:
+                        print("⚠️ Pi disconnected before AI audio send")
+                        break
+                    except RuntimeError:
+                        print("⚠️ websocket already closed")
+                        break
+                    finally:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
 
     except Exception as e:
         print(f"Conversation Error: {e}")
@@ -824,24 +908,51 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
     finally:
         print(f"💾 Visit {visit_id} End. Saving Audio...")
 
-        gcs_url = None
-        final_wav_name = f"visit_{visit_id}.wav"
+        gcs_url_vad = None
+        gcs_url_raw = None
 
-        # ✅ 방문자 말 구간만 합쳐서 저장 (AI 음성 안 섞임)
+        # =========================
+        # 4) VAD 기반 저장(말 구간만)
+        # =========================
         if visitor_audio_segments_for_save:
+            final_vad_wav = f"visit_{visit_id}_vad.wav"
             try:
                 full_audio = np.concatenate(visitor_audio_segments_for_save)
-                sf.write(final_wav_name, full_audio, 16000)
+                sf.write(final_vad_wav, full_audio, 16000)
 
-                gcs_url = await loop.run_in_executor(
-                    None, upload_to_gcs, final_wav_name, f"audio/visit_{visit_id}.wav"
+                gcs_url_vad = await loop.run_in_executor(
+                    None, upload_to_gcs, final_vad_wav, f"audio/visit_{visit_id}_vad.wav"
                 )
+                print("✅ VAD wav uploaded:", gcs_url_vad)
             except Exception as e:
-                print(f"Audio Save Error: {e}")
+                print("VAD Audio Save Error:", e)
             finally:
-                if os.path.exists(final_wav_name):
-                    os.remove(final_wav_name)
+                if os.path.exists(final_vad_wav):
+                    os.remove(final_vad_wav)
 
+        # =========================
+        # 5) ✅ 원본 전체 PCM 저장(fallback)
+        # =========================
+        if all_pcm_for_save:
+            final_raw_wav = f"visit_{visit_id}_raw48k.wav"
+            try:
+                raw_pcm = b"".join(all_pcm_for_save)
+                audio_int16 = np.frombuffer(raw_pcm, dtype=np.int16)
+                sf.write(final_raw_wav, audio_int16, 48000)
+
+                gcs_url_raw = await loop.run_in_executor(
+                    None, upload_to_gcs, final_raw_wav, f"audio/visit_{visit_id}_raw48k.wav"
+                )
+                print("✅ RAW wav uploaded:", gcs_url_raw)
+            except Exception as e:
+                print("RAW Audio Save Error:", e)
+            finally:
+                if os.path.exists(final_raw_wav):
+                    os.remove(final_raw_wav)
+
+        # =========================
+        # 6) Visit 요약/URL 저장
+        # =========================
         post_data = get_ai_post_processing(transcript)
 
         db = SessionLocal()
@@ -849,29 +960,20 @@ async def ws_conversation(websocket: WebSocket, device_uid: str):
             v = db.query(models.Visit).filter(models.Visit.id == visit_id).first()
             if v:
                 v.summary = post_data.get("summary", "요약 실패")
-                v.visitor_audio_url = gcs_url
 
-                appt = post_data.get("appointment")
-                if appt:
-                    try:
-                        new_appt = models.Appointment(
-                            title=appt["title"],
-                            start_time=datetime.datetime.fromisoformat(appt["start_time"]),
-                            user_id=user_id,
-                            visit_id=visit_id,
-                            created_at=get_kst_now()
-                        )
-                        db.add(new_appt)
-                    except:
-                        pass
-
+                # 우선순위: VAD > RAW
+                v.visitor_audio_url = gcs_url_vad or gcs_url_raw
                 db.commit()
+
                 notify_user(user_id, "대화 종료", f"요약: {v.summary}", db)
         finally:
             db.close()
 
-        active_conversations.discard(device_uid)
+        active_conversation_devices.discard(device_uid)
+        active_conversations_ws.pop(device_uid, None)
+
         print("✅ Done.")
+
 
 
 if __name__ == "__main__":
