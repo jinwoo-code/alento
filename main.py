@@ -83,6 +83,7 @@ origins = [
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
+    "https://alento-liart.vercel.app",
 ]
 
 app.add_middleware(
@@ -100,19 +101,26 @@ def get_kst_now():
 # --- 2. 헬퍼 함수 및 클래스 ---
 
 def notify_user(user_id: int, title: str, body: str, db):
-    try:
-        user = db.query(models.User).filter(models.User.id == user_id).first()
-        if not user or not user.push_token:
-            return 
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user or not user.push_token:
+        return
 
+    try:
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
             token=user.push_token,
         )
         messaging.send(message)
         print(f"🔔 FCM 전송: {title}")
+
     except Exception as e:
         print(f"⚠️ FCM 전송 실패: {e}")
+
+        # ✅ 토큰이 죽은 경우 DB에서 제거
+        if "Requested entity was not found" in str(e) or "unregistered" in str(e).lower():
+            user.push_token = None
+            db.commit()
+            print("🧹 죽은 push_token 제거 완료")
 
 class VideoConnectionManager:
     def __init__(self):
@@ -170,11 +178,12 @@ def startup_event():
     
     # Firebase
     try:
-        cred = credentials.Certificate(os.getenv("FIREBASE_ADMIN_KEY", "firebase_admin_key.json"))
+        cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/app/firebase_admin_key.json")
+        cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred)
         print("Firebase Init OK")
-    except Exception:
-        pass
+    except Exception as e:
+        print("Firebase Init Failed:", e)
 
     # GCS
     try:
